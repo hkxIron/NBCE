@@ -9,6 +9,7 @@ import torch
 from transformers import AutoTokenizer
 from transformers import LlamaForCausalLM
 from transformers import TopPLogitsWarper, LogitsProcessorList
+from typing import *
 
 # 经过微调的LLAMA
 # 下载地址：https://openbuddy.ai/
@@ -39,7 +40,7 @@ question = """请仔细阅读材料，逐一回答：
 
 # 拼接context和question
 contexts = [''] + contexts  # 添加空Context（无Context预测）
-batch = ['User: %s\n\n%s\n\nAssistant:' % (context, question) for context in contexts]
+batch:List[str] = ['User: %s\n\n%s\n\nAssistant:' % (context, question) for context in contexts]
 print('Context长度分布：', [len(text) for text in batch])
 print('Context总长度：', sum([len(text) for text in batch]))
 
@@ -48,17 +49,19 @@ processors = LogitsProcessorList()
 processors.append(TopPLogitsWarper(0.95))
 
 
-@torch.inference_mode()
-def generate(max_tokens):
+@torch.inference_mode() # Context-manager that enables or disables inference mode,推理模式
+def generate(max_tokens:int):
     """Naive Bayes-based Context Extension 演示代码
     """
-    inputs = tokenizer(batch, padding='longest', return_tensors='pt').to(device)
+    inputs = tokenizer(text=batch, padding='longest', return_tensors='pt').to(device)
+    #input_ids: [batch, max_seq_len]
     input_ids = inputs.input_ids
+    #attention_mask: [batch, max_seq_len]
     attention_mask = inputs.attention_mask
     
     print('input_ids', input_ids.shape)
     past_key_values = None
-    n = input_ids.shape[0]
+    n = input_ids.shape[0] # batch_size
     
     for i in range(max_tokens):
         # 模型输出
@@ -66,22 +69,35 @@ def generate(max_tokens):
                         attention_mask=attention_mask,
                         return_dict=True,
                         use_cache=True,
-                        past_key_values=past_key_values
+                        past_key_values=past_key_values # kv cache,加速推理
                        )
         past_key_values = outputs.past_key_values
         
         # ===== 核心代码开始 =====
         beta, eta = 0.25, 0.1
+        # logits:[batch, vocab_size]
         logits = outputs.logits[:, -1]
-        logits = logits - logits.logsumexp(dim=-1, keepdims=True)
-        logits = processors(input_ids, logits)
-        entropy = -(logits.exp() * logits.clip(-100, 0)).sum(dim=-1)
+        # logits:[batch, vocab_size]
+        logits = logits - logits.logsumexp(dim=-1, keepdims=True) # 归一化，得到真正的概率分布
+        # logits:[batch, vocab_size]
+        logits = processors(input_ids, logits) # top_p采样, logit即为log(p)
+        # logits:[batch, vocab_size]
+        # entropy:[batch]
+        # 计算熵：-p*log(p), 取熵最小的那个模型输出
+        entropy = -(logits.exp() * logits.clip(min=-100, max=0)).sum(dim=-1)
         if i > 0:
-            entropy[k] -= eta
-        k = entropy[1:].argmin() + 1
-        logits_max = logits[k]
-        logits_uncond = logits[0]
+            entropy[k] -= eta # 没明白为何熵要减去eta?
+
+        k = entropy[1:].argmin() + 1 # 取除了第一个无context以外的所有样本
+        # logits_max:[vocab_size]
+        logits_max = logits[k] # 熵最小，也就是概率最大
+        # logits_uncond:[vocab_size]
+        logits_uncond = logits[0] # 无context
+
+        # logits_merged:[vocab_size]
         logits_merged = (1 + beta) * logits_max - beta * logits_uncond
+        # 如果无context概率太小，则 beta * logits_uncond会接近于0，直接使用logits_max即可，否则还继续使用logits_max
+        # logits:[vocab_size]
         logits = torch.where(logits_uncond > -100, logits_merged, logits_max)
         # ===== 核心代码结束 =====
         
@@ -89,17 +105,23 @@ def generate(max_tokens):
         # tau = 1是标准的随机采样，tau->0则是贪心搜索
         # 简单起见，这里没有实现topk、topp截断
         tau = 0.01
+        # logits:[vocab_size]
         probas = torch.nn.functional.softmax(logits[None] / tau , dim=-1)
+        # 多项分布采样
         next_tokens = torch.multinomial(probas, num_samples=1).squeeze(1)        
-        if next_tokens[0] == tokenizer.eos_token_id:
+        if next_tokens[0] == tokenizer.eos_token_id: # end of sentence
             break
             
-        ret = tokenizer.batch_decode(next_tokens)
-        print(ret[0], flush=True, end='')
+        word = tokenizer.batch_decode(next_tokens)
+        print(word[0], flush=True, end='')
         
         # prepare for next iteration
+        # input_ids:[batch, seq+1]
         input_ids = next_tokens.unsqueeze(-1).tile(n, 1)
-        attention_mask = torch.cat([attention_mask, torch.ones(n, 1, dtype=torch.long, device=device)], dim=-1)        
+        # attention_mask:[batch, seq+1]
+        attention_mask = torch.cat([attention_mask,
+                                    torch.ones(n, 1, dtype=torch.long, device=device)
+                                    ], dim=-1)
 
 
 if __name__ == '__main__':
